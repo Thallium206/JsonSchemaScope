@@ -68,6 +68,7 @@ const refs = {
   formatButton: document.querySelector("#formatButton"),
   resetViewButton: document.querySelector("#resetViewButton"),
   jsonInput: document.querySelector("#jsonInput"),
+  foldGutter: document.querySelector("#foldGutter"),
   jsonMeta: document.querySelector("#jsonMeta"),
   graphMeta: document.querySelector("#graphMeta"),
   errorBox: document.querySelector("#errorBox"),
@@ -83,14 +84,43 @@ let updateTimer = 0;
 let userMovedView = false;
 let transform = { x: 52, y: 42, scale: 1 };
 let dragState = null;
+let sourceText = "";
+let isSyncingEditor = false;
+let foldableBlocks = [];
+let foldableById = new Map();
+let foldedRanges = new Map();
+let visibleLineMap = [];
+let sourceLineToVisibleLine = new Map();
+let lineFocusEntries = [];
 
-refs.jsonInput.value = JSON.stringify(sampleJson, null, 2);
+sourceText = JSON.stringify(sampleJson, null, 2);
+syncEditorProjection();
 renderFromInput({ fit: true });
 
+refs.jsonInput.addEventListener("beforeinput", () => {
+  if (foldedRanges.size > 0) unfoldAllAtCaret();
+});
+
+refs.jsonInput.addEventListener("keydown", (event) => {
+  if (foldedRanges.size === 0 || !isEditingKey(event)) return;
+  unfoldAllAtCaret();
+});
+
 refs.jsonInput.addEventListener("input", () => {
+  if (isSyncingEditor) return;
+  sourceText = refs.jsonInput.value;
+  foldedRanges.clear();
   updateTextMeta();
   clearTimeout(updateTimer);
   updateTimer = window.setTimeout(() => renderFromInput({ fit: false }), 180);
+});
+
+refs.jsonInput.addEventListener("scroll", () => {
+  renderFoldGutter();
+});
+
+refs.jsonInput.addEventListener("dblclick", (event) => {
+  focusGraphFromEditorLine(event);
 });
 
 refs.fileInput.addEventListener("change", async (event) => {
@@ -99,7 +129,9 @@ refs.fileInput.addEventListener("change", async (event) => {
 
   currentFileName = file.name || DEFAULT_FILE_NAME;
   refs.fileNameLabel.textContent = currentFileName;
-  refs.jsonInput.value = await file.text();
+  sourceText = await file.text();
+  foldedRanges.clear();
+  syncEditorProjection();
   userMovedView = false;
   renderFromInput({ fit: true });
   refs.fileInput.value = "";
@@ -107,8 +139,10 @@ refs.fileInput.addEventListener("change", async (event) => {
 
 refs.formatButton.addEventListener("click", () => {
   try {
-    const parsed = JSON.parse(refs.jsonInput.value);
-    refs.jsonInput.value = JSON.stringify(parsed, null, 2);
+    const parsed = JSON.parse(sourceText);
+    sourceText = JSON.stringify(parsed, null, 2);
+    foldedRanges.clear();
+    syncEditorProjection();
     renderFromInput({ fit: true });
   } catch (error) {
     showParseError(error);
@@ -189,13 +223,15 @@ function renderFromInput({ fit }) {
   updateTextMeta();
 
   try {
-    const parsed = JSON.parse(refs.jsonInput.value);
+    const parsed = JSON.parse(sourceText);
     hideParseError();
     currentGraph = buildGraph(parsed, currentFileName);
     layoutGraph(currentGraph);
     renderGraph();
+    refreshEditorStructure();
     if (fit || !userMovedView) fitGraphToViewport();
   } catch (error) {
+    clearEditorStructure();
     showParseError(error);
   }
 }
@@ -205,9 +241,12 @@ function buildGraph(data, fileName) {
   let nodeIndex = 0;
 
   const createObjectNode = (name, samples, meta = {}) => {
+    const path = meta.path || [];
     const node = {
       id: `node-${nodeIndex++}`,
       name,
+      path,
+      pathKey: pathKeyFromPath(path),
       fields: [],
       kind: meta.kind || "object",
       sampleCount: samples.length,
@@ -242,7 +281,8 @@ function buildGraph(data, fileName) {
 
       if (childSamples.length > 0) {
         const child = createObjectNode(key, childSamples, {
-          kind: values.some((value) => Array.isArray(value)) ? "array" : "object"
+          kind: values.some((value) => Array.isArray(value)) ? "array" : "object",
+          path: path.concat(key)
         });
         graph.edges.push({
           from: node.id,
@@ -258,12 +298,12 @@ function buildGraph(data, fileName) {
   };
 
   if (isPlainObject(data)) {
-    createObjectNode(fileName, [data], { kind: "object" });
+    createObjectNode(fileName, [data], { kind: "object", path: [] });
   } else if (Array.isArray(data)) {
     const objectSamples = collectObjectSamples([data]);
 
     if (objectSamples.length > 0) {
-      createObjectNode(fileName, objectSamples, { kind: "array" });
+      createObjectNode(fileName, objectSamples, { kind: "array", path: [] });
     } else {
       graph.nodes.push(createValueNode(fileName, `items: ${describeValues([data])}`, nodeIndex++));
     }
@@ -279,6 +319,8 @@ function createValueNode(name, fieldText, index) {
   return {
     id: `node-${index}`,
     name,
+    path: [],
+    pathKey: pathKeyFromPath([]),
     fields: [{
       name: fieldName,
       type,
@@ -446,6 +488,7 @@ function createNodeElement(node) {
   const element = document.createElement("article");
   element.className = "graph-node";
   element.dataset.nodeId = node.id;
+  element.dataset.pathKey = node.pathKey;
 
   const header = document.createElement("div");
   header.className = "node-header";
@@ -686,8 +729,341 @@ function applyTransform() {
   refs.graphCanvas.style.transform = `translate(${transform.x}px, ${transform.y}px) scale(${transform.scale})`;
 }
 
-function updateTextMeta() {
+function syncEditorProjection(options = {}) {
+  const scrollTop = refs.jsonInput.scrollTop;
+  const selection = options.selection || null;
+  const anchor = options.anchor || null;
+  const projection = projectSourceText();
+  let nextScrollTop = scrollTop;
+
+  isSyncingEditor = true;
+  if (refs.jsonInput.value !== projection) refs.jsonInput.value = projection;
+
+  if (selection) {
+    const offset = offsetFromLineColumn(refs.jsonInput.value, selection.line, selection.column);
+    refs.jsonInput.setSelectionRange(offset, offset);
+  }
+
+  if (anchor) {
+    const visibleLine = sourceLineToVisibleLine.get(anchor.sourceLine);
+    if (visibleLine !== undefined) {
+      nextScrollTop = visibleLine * getEditorLineHeight() - anchor.offsetY;
+    }
+  }
+
+  refs.jsonInput.scrollTop = Math.max(0, nextScrollTop);
+  isSyncingEditor = false;
+  updateTextMeta();
+  renderFoldGutter();
+
+  if (anchor) {
+    window.requestAnimationFrame(() => {
+      refs.jsonInput.scrollTop = Math.max(0, nextScrollTop);
+      renderFoldGutter();
+    });
+  }
+}
+
+function projectSourceText() {
+  const lines = splitLines(sourceText);
+  const activeFolds = getVisibleFoldedRanges();
+  const foldsByStartLine = new Map(activeFolds.map((fold) => [fold.startLine, fold]));
+  const projected = [];
+
+  visibleLineMap = [];
+  sourceLineToVisibleLine = new Map();
+
+  for (let sourceLine = 0; sourceLine < lines.length; sourceLine += 1) {
+    const fold = foldsByStartLine.get(sourceLine);
+    sourceLineToVisibleLine.set(sourceLine, projected.length);
+
+    if (fold) {
+      projected.push(createFoldPlaceholder(lines, fold));
+      visibleLineMap.push(sourceLine);
+      sourceLine = fold.endLine;
+      continue;
+    }
+
+    projected.push(lines[sourceLine]);
+    visibleLineMap.push(sourceLine);
+  }
+
+  return projected.join("\n");
+}
+
+function getVisibleFoldedRanges() {
+  const ranges = Array.from(foldedRanges.values())
+    .sort((a, b) => a.startLine - b.startLine || b.endLine - a.endLine);
+  const visible = [];
+
+  for (const range of ranges) {
+    const hiddenByParent = visible.some((parent) => (
+      parent.startLine < range.startLine && parent.endLine >= range.endLine
+    ));
+
+    if (!hiddenByParent) visible.push(range);
+  }
+
+  return visible;
+}
+
+function createFoldPlaceholder(lines, fold) {
+  const openLine = (lines[fold.startLine] || "").trimEnd();
+  const closeLine = (lines[fold.endLine] || "").trimEnd();
+  const closeToken = fold.type === "array" ? "]" : "}";
+  const comma = closeLine.endsWith(",") ? "," : "";
+  return `${openLine} ... ${closeToken}${comma}`;
+}
+
+function renderFoldGutter() {
+  refs.foldGutter.replaceChildren();
+
+  if (foldableBlocks.length === 0) return;
+
+  const lineHeight = getEditorLineHeight();
+  const paddingTop = getEditorPaddingTop();
+  const scrollTop = refs.jsonInput.scrollTop;
+  const usedVisibleLines = new Set();
+
+  for (const block of foldableBlocks) {
+    const visibleLine = sourceLineToVisibleLine.get(block.startLine);
+    if (visibleLine === undefined || usedVisibleLines.has(visibleLine)) continue;
+
+    usedVisibleLines.add(visibleLine);
+
+    const button = document.createElement("button");
+    const isCollapsed = foldedRanges.has(block.id);
+    button.type = "button";
+    button.tabIndex = -1;
+    button.className = `fold-button${isCollapsed ? " is-collapsed" : ""}`;
+    button.textContent = isCollapsed ? "+" : "-";
+    button.title = isCollapsed ? "Deplier" : "Replier";
+    button.style.top = `${paddingTop + visibleLine * lineHeight - scrollTop + 1}px`;
+    button.addEventListener("mousedown", (event) => event.preventDefault());
+    button.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      toggleFold(block.id);
+    });
+
+    refs.foldGutter.appendChild(button);
+  }
+}
+
+function toggleFold(blockId) {
+  const block = foldableById.get(blockId);
+  if (!block) return;
+
+  const lineHeight = getEditorLineHeight();
+  const visibleLineBefore = sourceLineToVisibleLine.get(block.startLine) ?? 0;
+  const anchor = {
+    sourceLine: block.startLine,
+    offsetY: visibleLineBefore * lineHeight - refs.jsonInput.scrollTop
+  };
+
+  if (foldedRanges.has(blockId)) {
+    foldedRanges.delete(blockId);
+  } else {
+    foldedRanges.set(blockId, block);
+  }
+
+  syncEditorProjection({ anchor });
+}
+
+function unfoldAllAtCaret() {
+  const caret = getEditorCaretLineColumn();
+  const sourceLine = visibleLineMap[caret.line] ?? caret.line;
+  foldedRanges.clear();
+  syncEditorProjection({
+    selection: {
+      line: sourceLine,
+      column: caret.column
+    }
+  });
+}
+
+function refreshEditorStructure() {
+  try {
+    const ast = parseJsonWithLocations(sourceText);
+    const lineStarts = getLineStarts(sourceText);
+    const graphPathKeys = new Set(currentGraph.nodes.map((node) => node.pathKey));
+    const nextFoldableBlocks = [];
+    const nextLineFocusEntries = [];
+
+    collectEditorBlocks(ast, {
+      graphPathKeys,
+      lineStarts,
+      foldableBlocks: nextFoldableBlocks,
+      lineFocusEntries: nextLineFocusEntries,
+      parentFocusPathKey: pathKeyFromPath([])
+    });
+
+    foldableBlocks = nextFoldableBlocks;
+    foldableById = new Map(foldableBlocks.map((block) => [block.id, block]));
+    lineFocusEntries = nextLineFocusEntries;
+
+    for (const id of Array.from(foldedRanges.keys())) {
+      if (!foldableById.has(id)) foldedRanges.delete(id);
+    }
+
+    syncEditorProjection();
+  } catch {
+    clearEditorStructure();
+  }
+}
+
+function clearEditorStructure() {
+  foldableBlocks = [];
+  foldableById = new Map();
+  foldedRanges.clear();
+  lineFocusEntries = [];
+  visibleLineMap = splitLines(sourceText).map((_, index) => index);
+  sourceLineToVisibleLine = new Map(visibleLineMap.map((line, index) => [line, index]));
+  renderFoldGutter();
+}
+
+function collectEditorBlocks(node, context) {
+  const startLine = lineFromIndex(context.lineStarts, node.start);
+  const endLine = lineFromIndex(context.lineStarts, Math.max(node.start, node.end - 1));
+  const pathKey = pathKeyFromPath(node.path || []);
+  const hasGraphNode = context.graphPathKeys.has(pathKey);
+  const focusPathKey = hasGraphNode ? pathKey : context.parentFocusPathKey;
+
+  if (focusPathKey) {
+    context.lineFocusEntries.push({
+      startLine,
+      endLine,
+      pathKey: focusPathKey,
+      depth: node.path ? node.path.length : 0
+    });
+  }
+
+  if ((node.type === "object" || node.type === "array") && endLine > startLine) {
+    context.foldableBlocks.push({
+      id: `${node.start}:${node.end}`,
+      type: node.type,
+      startLine,
+      endLine,
+      pathKey: focusPathKey
+    });
+  }
+
+  if (node.type === "object") {
+    for (const property of node.properties) {
+      collectEditorBlocks(property.value, {
+        ...context,
+        parentFocusPathKey: focusPathKey
+      });
+    }
+  }
+
+  if (node.type === "array") {
+    for (const item of node.items) {
+      collectEditorBlocks(item, {
+        ...context,
+        parentFocusPathKey: focusPathKey
+      });
+    }
+  }
+}
+
+function focusGraphFromEditorLine(event) {
+  const visibleLine = event ? getEditorLineFromPointer(event) : getEditorCaretLineColumn().line;
+  const sourceLine = visibleLineMap[visibleLine] ?? visibleLine;
+  const candidates = lineFocusEntries
+    .filter((entry) => sourceLine >= entry.startLine && sourceLine <= entry.endLine)
+    .sort((a, b) => {
+      const exactA = a.startLine === sourceLine ? 1 : 0;
+      const exactB = b.startLine === sourceLine ? 1 : 0;
+      const spanA = a.endLine - a.startLine;
+      const spanB = b.endLine - b.startLine;
+      return exactB - exactA || spanA - spanB || b.depth - a.depth;
+    });
+
+  if (candidates.length === 0) return;
+  focusGraphNode(candidates[0].pathKey);
+}
+
+function getEditorLineFromPointer(event) {
+  const rect = refs.jsonInput.getBoundingClientRect();
+  const y = event.clientY - rect.top + refs.jsonInput.scrollTop - getEditorPaddingTop();
+  return Math.max(0, Math.floor(y / getEditorLineHeight()));
+}
+
+function focusGraphNode(pathKey) {
+  const node = currentGraph.nodes.find((item) => item.pathKey === pathKey);
+  if (!node) return;
+
+  const element = refs.nodeLayer.querySelector(`[data-node-id="${cssEscape(node.id)}"]`);
+  if (!element) return;
+
+  refs.nodeLayer.querySelectorAll(".graph-node.is-focused")
+    .forEach((item) => item.classList.remove("is-focused"));
+  element.classList.add("is-focused");
+
+  const rect = refs.graphViewport.getBoundingClientRect();
+  const nextScale = clamp(Math.max(transform.scale, 0.76), 0.76, 1);
+  transform = {
+    x: rect.width / 2 - (node.x + node.width / 2) * nextScale,
+    y: rect.height / 2 - (node.y + node.height / 2) * nextScale,
+    scale: nextScale
+  };
+  userMovedView = true;
+  applyTransform();
+}
+
+function getEditorCaretLineColumn() {
   const text = refs.jsonInput.value;
+  const position = refs.jsonInput.selectionStart || 0;
+  let line = 0;
+  let lineStart = 0;
+
+  for (let index = 0; index < position; index += 1) {
+    if (text[index] === "\n") {
+      line += 1;
+      lineStart = index + 1;
+    }
+  }
+
+  return {
+    line,
+    column: position - lineStart
+  };
+}
+
+function offsetFromLineColumn(text, line, column) {
+  let currentLine = 0;
+  let index = 0;
+
+  while (currentLine < line && index < text.length) {
+    if (text[index] === "\n") currentLine += 1;
+    index += 1;
+  }
+
+  const lineEnd = text.indexOf("\n", index);
+  const maxOffset = lineEnd === -1 ? text.length : lineEnd;
+  return Math.min(index + column, maxOffset);
+}
+
+function getEditorLineHeight() {
+  const style = window.getComputedStyle(refs.jsonInput);
+  const lineHeight = Number.parseFloat(style.lineHeight);
+  if (Number.isFinite(lineHeight)) return lineHeight;
+  return Number.parseFloat(style.fontSize) * 1.55;
+}
+
+function getEditorPaddingTop() {
+  return Number.parseFloat(window.getComputedStyle(refs.jsonInput).paddingTop) || 0;
+}
+
+function isEditingKey(event) {
+  if (event.ctrlKey || event.metaKey || event.altKey) return false;
+  if (event.key.length === 1) return true;
+  return ["Backspace", "Delete", "Enter", "Tab"].includes(event.key);
+}
+
+function updateTextMeta() {
+  const text = sourceText;
   const lines = text.length === 0 ? 0 : text.split(/\r\n|\r|\n/).length;
   refs.jsonMeta.textContent = `${lines} ligne${lines > 1 ? "s" : ""}`;
 }
@@ -699,7 +1075,7 @@ function updateGraphMeta() {
 }
 
 function showParseError(error) {
-  const details = parseErrorDetails(refs.jsonInput.value, error);
+  const details = parseErrorDetails(sourceText, error);
   refs.errorBox.hidden = false;
   refs.errorBox.textContent = `Erreur JSON - ligne ${details.line}, colonne ${details.column}: ${details.message}`;
 }
@@ -707,6 +1083,235 @@ function showParseError(error) {
 function hideParseError() {
   refs.errorBox.hidden = true;
   refs.errorBox.textContent = "";
+}
+
+function parseJsonWithLocations(text) {
+  let index = 0;
+
+  const fail = () => {
+    throw { index };
+  };
+
+  const skipWhitespace = () => {
+    while (/[\s]/.test(text[index] || "")) index += 1;
+  };
+
+  const parseLiteral = (literal, type, path) => {
+    const start = index;
+    if (!text.startsWith(literal, index)) fail();
+    index += literal.length;
+    return { type, start, end: index, path };
+  };
+
+  const parseString = (path) => {
+    const start = index;
+    if (text[index] !== "\"") fail();
+    index += 1;
+
+    while (index < text.length) {
+      const char = text[index];
+
+      if (char === "\"") {
+        index += 1;
+        return {
+          type: "string",
+          start,
+          end: index,
+          value: JSON.parse(text.slice(start, index)),
+          path
+        };
+      }
+
+      if (char === "\\") {
+        index += 1;
+        const escape = text[index];
+        if (!"\"\\/bfnrtu".includes(escape || "")) fail();
+
+        if (escape === "u") {
+          for (let offset = 1; offset <= 4; offset += 1) {
+            if (!/[0-9a-fA-F]/.test(text[index + offset] || "")) fail();
+          }
+          index += 5;
+        } else {
+          index += 1;
+        }
+        continue;
+      }
+
+      if (char < " ") fail();
+      index += 1;
+    }
+
+    fail();
+  };
+
+  const parseNumber = (path) => {
+    const start = index;
+    if (text[index] === "-") index += 1;
+
+    if (text[index] === "0") {
+      index += 1;
+    } else if (/[1-9]/.test(text[index] || "")) {
+      while (/[0-9]/.test(text[index] || "")) index += 1;
+    } else {
+      fail();
+    }
+
+    if (text[index] === ".") {
+      index += 1;
+      if (!/[0-9]/.test(text[index] || "")) fail();
+      while (/[0-9]/.test(text[index] || "")) index += 1;
+    }
+
+    if (text[index] === "e" || text[index] === "E") {
+      index += 1;
+      if (text[index] === "+" || text[index] === "-") index += 1;
+      if (!/[0-9]/.test(text[index] || "")) fail();
+      while (/[0-9]/.test(text[index] || "")) index += 1;
+    }
+
+    return { type: "number", start, end: index, path };
+  };
+
+  const parseArray = (path) => {
+    const start = index;
+    const items = [];
+    index += 1;
+    skipWhitespace();
+
+    if (text[index] === "]") {
+      index += 1;
+      return { type: "array", start, end: index, path, items };
+    }
+
+    while (index < text.length) {
+      items.push(parseValue(path));
+      skipWhitespace();
+
+      if (text[index] === ",") {
+        index += 1;
+        skipWhitespace();
+        continue;
+      }
+
+      if (text[index] === "]") {
+        index += 1;
+        return { type: "array", start, end: index, path, items };
+      }
+
+      fail();
+    }
+
+    fail();
+  };
+
+  const parseObject = (path) => {
+    const start = index;
+    const properties = [];
+    index += 1;
+    skipWhitespace();
+
+    if (text[index] === "}") {
+      index += 1;
+      return { type: "object", start, end: index, path, properties };
+    }
+
+    while (index < text.length) {
+      const keyNode = parseString(path);
+      const propertyStart = keyNode.start;
+      skipWhitespace();
+
+      if (text[index] !== ":") fail();
+      index += 1;
+
+      const propertyPath = path.concat(keyNode.value);
+      const value = parseValue(propertyPath);
+      properties.push({
+        key: keyNode.value,
+        start: propertyStart,
+        end: value.end,
+        value,
+        path: propertyPath
+      });
+      skipWhitespace();
+
+      if (text[index] === ",") {
+        index += 1;
+        skipWhitespace();
+        continue;
+      }
+
+      if (text[index] === "}") {
+        index += 1;
+        return { type: "object", start, end: index, path, properties };
+      }
+
+      fail();
+    }
+
+    fail();
+  };
+
+  function parseValue(path) {
+    skipWhitespace();
+
+    if (index >= text.length) fail();
+
+    const char = text[index];
+    if (char === "\"") return parseString(path);
+    if (char === "{") return parseObject(path);
+    if (char === "[") return parseArray(path);
+    if (char === "-" || /[0-9]/.test(char)) return parseNumber(path);
+    if (char === "t") return parseLiteral("true", "boolean", path);
+    if (char === "f") return parseLiteral("false", "boolean", path);
+    if (char === "n") return parseLiteral("null", "null", path);
+    fail();
+  }
+
+  const root = parseValue([]);
+  skipWhitespace();
+  if (index < text.length) fail();
+  return root;
+}
+
+function splitLines(text) {
+  return text.split(/\r\n|\r|\n/);
+}
+
+function getLineStarts(text) {
+  const starts = [0];
+
+  for (let index = 0; index < text.length; index += 1) {
+    if (text[index] === "\r") {
+      if (text[index + 1] === "\n") index += 1;
+      starts.push(index + 1);
+    } else if (text[index] === "\n") {
+      starts.push(index + 1);
+    }
+  }
+
+  return starts;
+}
+
+function lineFromIndex(lineStarts, index) {
+  let low = 0;
+  let high = lineStarts.length - 1;
+
+  while (low <= high) {
+    const middle = Math.floor((low + high) / 2);
+
+    if (lineStarts[middle] <= index) {
+      low = middle + 1;
+    } else {
+      high = middle - 1;
+    }
+  }
+
+  return Math.max(0, high);
+}
+
+function pathKeyFromPath(path) {
+  return JSON.stringify(path || []);
 }
 
 function parseErrorDetails(text, error) {

@@ -33,7 +33,10 @@
             <label for="jsonInput">JSON</label>
             <span id="jsonMeta">0 ligne</span>
           </div>
-          <textarea id="jsonInput" spellcheck="false" autocomplete="off" autocapitalize="off"></textarea>
+          <div class="editor-wrap">
+            <div id="foldGutter" class="fold-gutter" aria-hidden="true"></div>
+            <textarea id="jsonInput" spellcheck="false" autocomplete="off" autocapitalize="off"></textarea>
+          </div>
           <div id="errorBox" class="error-box" role="status" hidden></div>
         </section>
 
