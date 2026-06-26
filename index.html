@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>JSON Structure Graph</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true">JS</div>
+          <div>
+            <h1>JSON Structure Graph</h1>
+            <p id="fileNameLabel">nom.json</p>
+          </div>
+        </div>
+
+        <div class="actions">
+          <label class="button file-button">
+            <input id="fileInput" type="file" accept=".json,application/json">
+            Importer
+          </label>
+          <button id="formatButton" class="button" type="button">Formater</button>
+          <button id="resetViewButton" class="button" type="button">Recentrer</button>
+        </div>
+      </header>
+
+      <main class="workspace">
+        <section class="editor-pane" aria-label="Editeur JSON">
+          <div class="pane-title">
+            <label for="jsonInput">JSON</label>
+            <span id="jsonMeta">0 ligne</span>
+          </div>
+          <textarea id="jsonInput" spellcheck="false" autocomplete="off" autocapitalize="off"></textarea>
+          <div id="errorBox" class="error-box" role="status" hidden></div>
+        </section>
+
+        <section class="graph-pane" aria-label="Graphe de structure">
+          <div class="pane-title">
+            <span>Structure</span>
+            <span id="graphMeta">0 noeud</span>
+          </div>
+          <div id="graphViewport" class="graph-viewport">
+            <div id="graphCanvas" class="graph-canvas">
+              <svg id="edgeLayer" class="edge-layer" aria-hidden="true"></svg>
+              <div id="nodeLayer" class="node-layer"></div>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <script src="app.js"></script>
+  </body>
+</html>
